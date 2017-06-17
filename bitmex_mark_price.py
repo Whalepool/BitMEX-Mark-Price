@@ -72,11 +72,11 @@ decodedata2=scrapeurl(instrument)
 #Index
 postedindexprice=decodedata2[0]['indicativeSettlePrice']
 #Reported ImpactBidPrice
-postedimpactbid=decodedata2[0]['impactMidPrice']
+postedimpactbid=decodedata2[0]['impactBidPrice']
 #Reported ImpactAskPrice
 postedimpactask=decodedata2[0]['impactAskPrice']
 #Reported ImpactMidPrice
-postedimpactmid=decodedata2[0]['impactBidPrice']
+postedimpactmid=decodedata2[0]['impactMidPrice']
 #Reported FairBasis
 postedfairbasis=decodedata2[0]['fairBasis']
 #Reported FairBasisRate
