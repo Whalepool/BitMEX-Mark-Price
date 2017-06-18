@@ -7,11 +7,13 @@ from urllib.request import urlopen
 import json
 import dateutil.parser
 from prettytable import PrettyTable
+import time
 
 # Initial setup parameters
 DEBUG = False
 SYMBOL = "XBTU17"
 IMPACT_NOTIONAL = 10 * 1e8
+ONE_YEAR = 60 * 60 * 24 * 365
 
 #################################################################################
 #   Computing BitMEX Mark Price                                             #
@@ -141,24 +143,14 @@ def getImpactPrices(instrument):
 
 def fullCalculation(instrument):
 
-    # Calculate the time to expiry by grabbing the expiry TS format and the current timestamp
-    expiryts = instrument['expiry']
-    timestampts = instrument['timestamp']
+    # Calculate the time to expiry by grabbing the expiry TS
+    expiryDate = dateutil.parser.parse(instrument['expiry'])
 
-    # Have to get into integer format from BitMEX's stamp format
-    expiryd = dateutil.parser.parse(expiryts)
-    timestampd = dateutil.parser.parse(timestampts)
+    # Get seconds until expiry
+    timeUntilExpirySec = round(expiryDate.timestamp() - time.time())
+    timeUntilExpiryYears = timeUntilExpirySec / ONE_YEAR
 
-    # Round down to the seconds
-    timestampsec = round(timestampd.timestamp())
-    expirysec = round(expiryd.timestamp())
-
-    tteseconds = expirysec-timestampsec
-
-    # Finally, put it into days
-    ttedays = tteseconds/60/60/24  # This shows the value of days in a fraction down to the second. Maybe BitMEX rounds up or down?
-    TTE = ttedays  # This will be used for the fair basis calculations at the bottom of script
-    print("Time to Expiry: %.2f Days" % TTE)
+    print("Time to Expiry: %.2f Days" % (timeUntilExpirySec / (60 * 60 * 24)))
 
     # Impact Mid computation matches up close (but not perfect) with BitMEX's posted
     impactBid, impactMid, impactAsk = getImpactPrices(instrument)
@@ -172,8 +164,8 @@ def fullCalculation(instrument):
     # Fair Value   = Index Price * % Fair Basis * (Time to Expiry / 365)
     # Fair Price   = Index Price + Fair Value
 
-    fairBasisRate = (impactMid / indexPrice-1) / (TTE / 365)
-    fairBasis = indexPrice * fairBasisRate * (TTE / 365)
+    fairBasisRate = (impactMid / indexPrice-1) / timeUntilExpiryYears
+    fairBasis = indexPrice * fairBasisRate * timeUntilExpiryYears
     fairPrice = indexPrice + fairBasis
 
     return {
