@@ -9,9 +9,9 @@ import dateutil.parser
 from prettytable import PrettyTable
 
 # Initial setup parameters
-
+DEBUG = False
 SYMBOL = "XBTU17"
-IMPACT_NOTIONAL = 10
+IMPACT_NOTIONAL = 10 * 1e8
 
 #################################################################################
 #   Computing BitMEX Mark Price                                             #
@@ -44,9 +44,9 @@ IMPACT_NOTIONAL = 10
 #
 ########################################################################
 
-# We're going to be scraping a few api endpoints so easier to use this little f
 
 def scrapeurl(url):
+    '''Easy http fetch'''
     page = urlopen(url)
     data = page.read()
     decodedata = json.loads(data.decode())
@@ -77,85 +77,69 @@ def pluck(dict, *args):
     return (dict[arg] for arg in args)
 
 
-def getImpactPrices(symbol):
+def value(multiplier, price, qty):
+    '''Returns the value of a book level, in satoshis'''
+    contVal = abs(multiplier * price if multiplier > 0 else multiplier / price)
+    return round(qty * contVal)
+
+
+def calculateImpactSide(instrument, book, side):
+    '''
+    The way we compute Impact Prices is by going into either side
+    of the book for 10 BTC worth of order values, and take the average
+    price filled.
+    '''
+    notional = 0
+    impactPrice = 0
+
+    for orderBookItem in book:
+        size = orderBookItem[side + 'Size']
+        price = orderBookItem[side + 'Price']
+
+        # No more book levels; will create a situation where `hasLiquidity: false`
+        if size is None or price is None:
+            break
+
+        # No more to do
+        if notional >= IMPACT_NOTIONAL:
+            break
+
+        # Calculate value. Contract may be inverse, linear, or quanto.
+        levelValue = value(instrument['multiplier'], price, size)
+
+        # Calculate an average price, up to the IMPACT_NOTIONAL.
+        remainingValue = min(levelValue, IMPACT_NOTIONAL - notional)
+        notional += remainingValue
+        impactPrice += (remainingValue / IMPACT_NOTIONAL) * price
+        if DEBUG:
+            print('side: %s, levelValue: %.2f, price: %.2f, size: %d, remainingValue: %.2f, notional: %.2f, impactPrice: %.2f' %
+                  (side, levelValue / 1e8, price, size, remainingValue / 1e8, notional / 1e8, impactPrice))
+
+    return impactPrice
+
+
+def getImpactPrices(instrument):
     # Grab the Orderbook so we can grab the depth for bids and asks for impact prices
+    symbol = instrument['symbol']
+    fullBook = scrapeurl("https://www.bitmex.com/api/v1/orderBook?symbol="+symbol+"&depth=200")
 
-    decodedata = scrapeurl("https://www.bitmex.com/api/v1/orderBook?symbol="+symbol+"&depth=200")
+    impactBid = calculateImpactSide(instrument, fullBook, 'bid')
+    impactAsk = calculateImpactSide(instrument, fullBook, 'ask')
 
-    # Set base values for the amount of bids & asks left until hittign IMPACT_NOTIONAL in BTC value
-    bidsleft = asksleft = 0
+    # The % Fair Basis is updated each minute but only if the difference between the Impact Ask Price and
+    # Impact Bid Price is less than the maintenance margin of the futures contract.
+    # After it has been updated the Fair Price will be equal to the Impact Mid Price,
+    # and then the Fair Price will float with regard to the Index Price and the time-to-expiry
+    # decay on the contract until the next update.
+    if abs(impactBid - impactAsk) > (instrument['midPrice'] / instrument['maintMargin']):
+        print('Note: impactBid and impactAsk are farther apart than 1x maintMargin; hasLiquidity would be ' +
+              'false, and the instrument\'s fair basis will not update until the prices converge again.')
 
-    # Set the base value for the impact bid and asks prices
-    impactBid = impactAsk = 0
-
-    ######################################################################
-    # The way we compute Impact Prices is by going into either side      #
-    # of the book for 10 BTC worth of order values, and take the average #
-    # price filled.                                                      #
-    ######################################################################
-
-    # To do this, we loop over every orderbook level from BitMEX for the instrument
-    for orderBookItem in decodedata:
-        level, bidSize, bidPrice = pluck(orderBookItem, 'level', 'bidSize', 'bidPrice')
-
-        # Code for Impact bid
-
-        # make sure the parms are both not null
-        if bidSize is not None and bidPrice is not None:
-            # What is most important with inverse futures is notional BTC value, so we compute the BTC order value
-            bidbtc = bidSize/bidPrice
-
-        # Check that the amount of bids left until IMPACT_NOTIONAL is below the IMPACT_NOTIONAL
-        if bidsleft < IMPACT_NOTIONAL:
-            # Add to the running count of how many BTC is left in comparison to IMPACT_NOTIONAL
-            bidsleft = bidsleft+bidbtc
-
-            # The average price is the bid price at each level weighted by the level's BTC size as proportion of IMPACT_NOTIONAL
-            impactBid = impactBid+(bidbtc/IMPACT_NOTIONAL)*bidPrice
-
-            # If the current order level pushes above IMPACT_NOTIONAL count, then we re-compute the impactBid
-            if bidsleft > IMPACT_NOTIONAL:
-                impactBid = impactBid-(bidbtc/IMPACT_NOTIONAL)*bidPrice
-
-                # Wind back to prior level
-                priorlastbid = bidsleft-bidbtc
-
-                # We only want to have the last amount up to IMPACT_NOTIONAL, not the part above
-
-                lastbid = IMPACT_NOTIONAL-priorlastbid
-
-                # This will be the impact bid instead
-                impactBid = impactBid+bidPrice*(lastbid/IMPACT_NOTIONAL)
-
-        # Code for Impact ask
-        # See comments above, same exact format
-        askSize, askPrice = pluck(orderBookItem, 'askSize', 'askPrice')
-
-        if askSize is not None and askPrice is not None:
-            askbtc = askSize/askPrice
-
-        if asksleft < IMPACT_NOTIONAL:
-            asksleft = asksleft+askbtc
-
-            impactAsk = impactAsk+(askbtc/IMPACT_NOTIONAL)*askPrice
-
-            if asksleft > IMPACT_NOTIONAL:
-                impactAsk = impactAsk-(askbtc/IMPACT_NOTIONAL)*askPrice
-                priorlastask = asksleft-askbtc
-                lastask = IMPACT_NOTIONAL-priorlastask
-                impactAsk = impactAsk+askPrice*(lastask/IMPACT_NOTIONAL)
-
-    # Calc impact mid
-    impactMid = (impactAsk+impactBid)/2
-
+    impactMid = (impactBid + impactAsk) / 2
     return (impactBid, impactMid, impactAsk)
 
-#######################################################################
-# First let's grab some stats about the symbol instrument
 
-def main():
-
-    instrument = getInstrument(SYMBOL)
+def fullCalculation(instrument):
 
     # Calculate the time to expiry by grabbing the expiry TS format and the current timestamp
     expiryts = instrument['expiry']
@@ -177,7 +161,7 @@ def main():
     print("Time to Expiry: %.2f Days" % TTE)
 
     # Impact Mid computation matches up close (but not perfect) with BitMEX's posted
-    impactBid, impactMid, impactAsk = getImpactPrices(SYMBOL)
+    impactBid, impactMid, impactAsk = getImpactPrices(instrument)
 
     # Fair price calculation
     indexPrice = makeXBTIndex()
@@ -188,9 +172,22 @@ def main():
     # Fair Value   = Index Price * % Fair Basis * (Time to Expiry / 365)
     # Fair Price   = Index Price + Fair Value
 
-    fairBasis = (impactMid / indexPrice-1) / (TTE / 365)
-    fairValue = indexPrice * fairBasis * (TTE / 365)
-    fairPrice = indexPrice + fairValue
+    fairBasisRate = (impactMid / indexPrice-1) / (TTE / 365)
+    fairBasis = indexPrice * fairBasisRate * (TTE / 365)
+    fairPrice = indexPrice + fairBasis
+
+    return {
+        'indicativeSettlePrice': indexPrice,
+        'impactBidPrice': impactBid,
+        'impactAskPrice': impactAsk,
+        'impactMidPrice': impactMid,
+        'fairBasisRate': fairBasisRate,
+        'fairBasis': fairBasis,
+        'fairPrice': fairPrice
+    }
+
+
+def printResults(instrument, calcResult):
 
     def makeResults(indexPrice, impactBid, impactAsk, impactMid, fairBasisRate, fairBasis, markPrice):
         return [
@@ -206,14 +203,23 @@ def main():
     table = PrettyTable(['Key', 'BitMEX', 'Computed'])
     table.float_format = ".2"
     table.align = 'r'
-    table.add_row(['Index Price', instrument['indicativeSettlePrice'], indexPrice])
-    table.add_row(['Impact Bid', instrument['impactBidPrice'], impactBid])
-    table.add_row(['Impact Ask', instrument['impactAskPrice'], impactAsk])
-    table.add_row(['Impact Mid', instrument['impactMidPrice'], impactMid])
-    table.add_row(['Fair Basis Rate', instrument['fairBasisRate'], fairBasis])
-    table.add_row(['Fair Basis', instrument['fairBasis'], fairValue])
-    table.add_row(['Fair Price', instrument['fairPrice'], fairPrice])
+    table.add_row(['Index Price', instrument['indicativeSettlePrice'], calcResult['indicativeSettlePrice']])
+    table.add_row(['Impact Bid', instrument['impactBidPrice'], calcResult['impactBidPrice']])
+    table.add_row(['Impact Ask', instrument['impactAskPrice'], calcResult['impactAskPrice']])
+    table.add_row(['Impact Mid', instrument['impactMidPrice'], calcResult['impactMidPrice']])
+    table.add_row(['Fair Basis Rate', instrument['fairBasisRate'], calcResult['fairBasisRate']])
+    table.add_row(['Fair Basis', instrument['fairBasis'], calcResult['fairBasis']])
+    table.add_row(['Fair Price', instrument['fairPrice'], calcResult['fairPrice']])
     print(table)
+
+#######################################################################
+
+
+def main():
+    instrument = getInstrument(SYMBOL)
+    calcResult = fullCalculation(instrument)
+    printResults(instrument, calcResult)
+
 
 # Init
 if __name__ == "__main__":
