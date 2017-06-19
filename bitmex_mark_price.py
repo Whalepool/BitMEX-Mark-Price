@@ -76,11 +76,6 @@ def getInstrument(symbol):
     return scrapeurl("https://www.bitmex.com/api/v1/instrument?symbol="+symbol)[0]
 
 
-def pluck(dict, *args):
-    '''Returns destructurable keys from dict'''
-    return (dict[arg] for arg in args)
-
-
 def value(multiplier, price, qty):
     '''Returns the value of a book level, in satoshis'''
     contVal = abs(multiplier * price if multiplier > 0 else multiplier / price)
@@ -192,7 +187,7 @@ def printResults(instrument, calcResult):
         ['Impact Bid', 'impactBidPrice'],
         ['Impact Ask', 'impactAskPrice'],
         ['Impact Mid', 'impactMidPrice'],
-        ['%% Fair Basis Rate', 'fairBasisRate', lambda x: "%.2f%%" % (x * 100)],
+        ['% Fair Basis Rate', 'fairBasisRate', lambda x: "%.2f%%" % (x * 100)],
         ['Fair Basis', 'fairBasis'],
         ['Fair Price', 'fairPrice']
     ]
