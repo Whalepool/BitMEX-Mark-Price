@@ -2,26 +2,24 @@
 #Written by swapman
 #Telegram: @swapman
 #Twitter: @whalepool
- 
-import os
-import re
-import datetime
+
 from urllib.request import urlopen
 import json
-import math
-import time
 import dateutil.parser
- 
-#Initial setup parameters
- 
-SYMBOL="XBTU17"
-IMPACT_NOTIONAL=10
- 
+from prettytable import PrettyTable
+import time
+
+# Initial setup parameters
+DEBUG = False
+SYMBOL = "XBTU17"
+IMPACT_NOTIONAL = 10 * 1e8
+ONE_YEAR = 60 * 60 * 24 * 365
+
 #################################################################################
 #   Computing BitMEX Mark Price                                             #
 #
 #       This is for non-perpetual futures contracts.
-#        
+#
 #       The main variables are:
 #
 #            - orderbook depth
@@ -47,182 +45,174 @@ IMPACT_NOTIONAL=10
 #       Finally the "fair price" is the sum of the index and this fair value.
 #
 ########################################################################
- 
-#we're going to be scraping a few api endpoints so easier to use this little f
- 
+
+
 def scrapeurl(url):
+    '''Easy http fetch'''
     page = urlopen(url)
-    data=page.read()
-    decodedata=json.loads(data.decode())
+    data = page.read()
+    decodedata = json.loads(data.decode())
     return decodedata
- 
- 
- 
+
+
+def makeXBTIndex():
+    # Let's manually compute the BitMEX BTC/USD index for good measure
+    # As of now it's 50/50 GDAX and Bitstamp
+
+    urlb = "https://www.bitstamp.net/api/ticker"
+    decodedatab = scrapeurl(urlb)
+    stampprice = decodedatab['last']
+
+    urlg = "https://api.gdax.com/products/BTC-USD/ticker"
+    decodedatag = scrapeurl(urlg)
+    gdaxprice = decodedatag['price']
+
+    return (float(stampprice)+float(gdaxprice)) / 2
+
+
+def getInstrument(symbol):
+    return scrapeurl("https://www.bitmex.com/api/v1/instrument?symbol="+symbol)[0]
+
+
+def pluck(dict, *args):
+    '''Returns destructurable keys from dict'''
+    return (dict[arg] for arg in args)
+
+
+def value(multiplier, price, qty):
+    '''Returns the value of a book level, in satoshis'''
+    contVal = abs(multiplier * price if multiplier > 0 else multiplier / price)
+    return round(qty * contVal)
+
+
+def calculateImpactSide(instrument, book, side):
+    '''
+    The way we compute Impact Prices is by going into either side
+    of the book for 10 BTC worth of order values, and take the average
+    price filled.
+    '''
+    notional = 0
+    impactPrice = 0
+
+    for orderBookItem in book:
+        size = orderBookItem[side + 'Size']
+        price = orderBookItem[side + 'Price']
+
+        # No more book levels; will create a situation where `hasLiquidity: false`
+        if size is None or price is None:
+            break
+
+        # No more to do
+        if notional >= IMPACT_NOTIONAL:
+            break
+
+        # Calculate value. Contract may be inverse, linear, or quanto.
+        levelValue = value(instrument['multiplier'], price, size)
+
+        # Calculate an average price, up to the IMPACT_NOTIONAL.
+        remainingValue = min(levelValue, IMPACT_NOTIONAL - notional)
+        notional += remainingValue
+        impactPrice += (remainingValue / IMPACT_NOTIONAL) * price
+        if DEBUG:
+            print('side: %s, levelValue: %.2f, price: %.2f, size: %d, remainingValue: %.2f, notional: %.2f, impactPrice: %.2f' %
+                  (side, levelValue / 1e8, price, size, remainingValue / 1e8, notional / 1e8, impactPrice))
+
+    return impactPrice
+
+
+def getImpactPrices(instrument):
+    # Grab the Orderbook so we can grab the depth for bids and asks for impact prices
+    symbol = instrument['symbol']
+    fullBook = scrapeurl("https://www.bitmex.com/api/v1/orderBook?symbol="+symbol+"&depth=200")
+
+    impactBid = calculateImpactSide(instrument, fullBook, 'bid')
+    impactAsk = calculateImpactSide(instrument, fullBook, 'ask')
+
+    # The % Fair Basis is updated each minute but only if the difference between the Impact Ask Price and
+    # Impact Bid Price is less than the maintenance margin of the futures contract.
+    # After it has been updated the Fair Price will be equal to the Impact Mid Price,
+    # and then the Fair Price will float with regard to the Index Price and the time-to-expiry
+    # decay on the contract until the next update.
+    if abs(impactBid - impactAsk) > (instrument['midPrice'] / instrument['maintMargin']):
+        print('Note: impactBid and impactAsk are farther apart than 1x maintMargin; hasLiquidity would be ' +
+              'false, and the instrument\'s fair basis will not update until the prices converge again.')
+
+    impactMid = (impactBid + impactAsk) / 2
+    return (impactBid, impactMid, impactAsk)
+
+
+def fullCalculation(instrument):
+
+    # Calculate the time to expiry by grabbing the expiry TS
+    expiryDate = dateutil.parser.parse(instrument['expiry'])
+
+    # Get seconds until expiry
+    timeUntilExpirySec = round(expiryDate.timestamp() - time.time())
+    timeUntilExpiryYears = timeUntilExpirySec / ONE_YEAR
+
+    print("Time to Expiry: %.2f Days" % (timeUntilExpirySec / (60 * 60 * 24)))
+
+    # Impact Mid computation matches up close (but not perfect) with BitMEX's posted
+    impactBid, impactMid, impactAsk = getImpactPrices(instrument)
+
+    # Fair price calculation
+    indexPrice = makeXBTIndex()
+
+    # From the BitMEX site https://www.bitmex.com/app/fairPriceMarking :
+
+    # % Fair Basis = (Impact Mid Price / Index Price - 1) / (Time To Expiry / 365)
+    # Fair Value   = Index Price * % Fair Basis * (Time to Expiry / 365)
+    # Fair Price   = Index Price + Fair Value
+
+    fairBasisRate = (impactMid / indexPrice-1) / timeUntilExpiryYears
+    fairBasis = indexPrice * fairBasisRate * timeUntilExpiryYears
+    fairPrice = indexPrice + fairBasis
+
+    return {
+        'indicativeSettlePrice': indexPrice,
+        'impactBidPrice': impactBid,
+        'impactAskPrice': impactAsk,
+        'impactMidPrice': impactMid,
+        'fairBasisRate': fairBasisRate,
+        'fairBasis': fairBasis,
+        'fairPrice': fairPrice
+    }
+
+
+def printResults(instrument, calcResult):
+
+    def makeResults(indexPrice, impactBid, impactAsk, impactMid, fairBasisRate, fairBasis, markPrice):
+        return [
+            'Index Price: %.2f' % indexPrice,
+            'Impact Bid: %.2f' % impactBid,
+            'Impact Ask: %.2f' % impactAsk,
+            'Impact Mid: %.2f' % impactMid,
+            'Fair Basis Rate: %.2f' % fairBasisRate,
+            'Fair Basis: %.2f' % fairBasis,
+            'Mark/Fair Price: %.2f' % markPrice,
+        ]
+
+    table = PrettyTable(['Key', 'BitMEX', 'Computed'])
+    table.float_format = ".2"
+    table.align = 'r'
+    table.add_row(['Index Price', instrument['indicativeSettlePrice'], calcResult['indicativeSettlePrice']])
+    table.add_row(['Impact Bid', instrument['impactBidPrice'], calcResult['impactBidPrice']])
+    table.add_row(['Impact Ask', instrument['impactAskPrice'], calcResult['impactAskPrice']])
+    table.add_row(['Impact Mid', instrument['impactMidPrice'], calcResult['impactMidPrice']])
+    table.add_row(['Fair Basis Rate', instrument['fairBasisRate'], calcResult['fairBasisRate']])
+    table.add_row(['Fair Basis', instrument['fairBasis'], calcResult['fairBasis']])
+    table.add_row(['Fair Price', instrument['fairPrice'], calcResult['fairPrice']])
+    print(table)
+
 #######################################################################
-# First let's grab some stats about the symbol instrument
- 
-instrument="https://www.bitmex.com/api/v1/instrument?symbol="+SYMBOL
- 
-decodedata2=scrapeurl(instrument)
- 
-#Set relevant vars from the scraped output
- 
-#We want to collect the prices that BitMEX reports
- 
-#Index
-postedindexprice=decodedata2[0]['indicativeSettlePrice']
-#Reported ImpactBidPrice
-postedimpactbid=decodedata2[0]['impactBidPrice']
-#Reported ImpactAskPrice
-postedimpactask=decodedata2[0]['impactAskPrice']
-#Reported ImpactMidPrice
-postedimpactmid=decodedata2[0]['impactMidPrice']
-#Reported FairBasis
-postedfairbasis=decodedata2[0]['fairBasis']
-#Reported FairBasisRate
-postedfairbasisrate=decodedata2[0]['fairBasisRate']
-#Reported Mark Price
-postedmarkprice=decodedata2[0]['markPrice']
- 
-#Now we calculate the time to expiry by grabbing the expiry TS format and the current timestamp
-expiryts=decodedata2[0]['expiry']
-timestampts=decodedata2[0]['timestamp']
- 
-#Have to get into integer format from BitMEX's stamp format
-expiryd=dateutil.parser.parse(expiryts)
-timestampd=dateutil.parser.parse(timestampts)
- 
-#Round down to the seconds
-timestampsec=round(timestampd.timestamp())
-expirysec=round(expiryd.timestamp())
- 
-tteseconds=expirysec-timestampsec
- 
-#Finally, put it into days
-ttedays=tteseconds/60/60/24 # This shows the value of days in a fraction down to the second. Maybe BitMEX rounds up or down?
-TTE=ttedays #This will be used for the fair basis calculations at the bottom of script
-print("Time to Expiry: "+str(TTE))
- 
-#Let's manually compute the BitMEX BTC/USD index for good measure
-#As of now it's 50/50 GDAX and Bitstamp
- 
-urlb = "https://www.bitstamp.net/api/ticker"
-decodedatab=scrapeurl(urlb)
-stampprice=decodedatab['last'];
- 
-urlg = "https://api.gdax.com/products/BTC-USD/ticker"
-decodedatag=scrapeurl(urlg)
-gdaxprice=decodedatag['price'];
- 
-indexprice=(float(stampprice)+float(gdaxprice))/2;
- 
- 
-#Grab the Orderbook so we can grab the depth for bids and asks for impact prices
- 
-url = "https://www.bitmex.com/api/v1/orderBook?symbol="+SYMBOL+"&depth=200"
-decodedata=scrapeurl(url)
- 
-#Set base values for the amount of bids & asks left until hittign IMPACT_NOTIONAL in BTC value
- 
-bidsleft=0
-asksleft=0
- 
-#Set the base value for the impact bid and asks prices
- 
-impactbid=0
-impactask=0
- 
-#Set switch for when the IMPACT_NOTIONAL for bids and asks is hit by the script
- 
-bidsdone=0
-asksdone=0
- 
-######################################################################
-# The way we compute Impact Prices is by going into either side      #
-# of the book for 10 BTC worth of order values, and take the average #
-# price filled.                                                      #
-######################################################################
- 
- 
-#To do this, we loop over every orderbook level from BitMEX for the instrument
- 
-for x in decodedata:
-    level = x['level']
- 
-    #Code for Impact bid
-   
-    bidsize=x['bidSize']
-    bidprice=x['bidPrice']
-    #make sure the parms are both not null
-    if bidsize is not None and bidprice is not None:
-        # What is most important with inverse futures is notional BTC value, so we compute the BTC order value
-        bidbtc=bidsize/bidprice
-   
-    #Check that the amount of bids left until IMPACT_NOTIONAL is below the IMPACT_NOTIONAL
-    if bidsleft<IMPACT_NOTIONAL:
-        #Add to the running count of how many BTC is left in comparison to IMPACT_NOTIONAL
-        bidsleft=bidsleft+bidbtc
- 
-        #The average price is the bid price at each level weighted by the level's BTC size as proportion of IMPACT_NOTIONAL
-        impactbid=impactbid+(bidbtc/IMPACT_NOTIONAL)*bidprice
-       
-        #If the current order level pushes above IMPACT_NOTIONAL count, then we re-compute the impactbid
-        if bidsleft>IMPACT_NOTIONAL:
-            impactbid=impactbid-(bidbtc/IMPACT_NOTIONAL)*bidprice
- 
-            # Wind back to prior level
- 
-            priorlastbid=bidsleft-bidbtc
- 
-            # We only want to have the last amount up to IMPACT_NOTIONAL, not the part above
- 
-            lastbid=IMPACT_NOTIONAL-priorlastbid
- 
-            # This will be the impact bid instead
-            impactbid=impactbid+bidprice*(lastbid/IMPACT_NOTIONAL)
- 
- 
-    #Code for Impact ask
-    #See comments above, same exact format
-    asksize=x['askSize']
-    askprice=x['askPrice']
-    if asksize is not None and askprice is not None:
-        askbtc=asksize/askprice
- 
-    if asksleft<IMPACT_NOTIONAL:
-        asksleft=asksleft+askbtc
- 
-        impactask=impactask+(askbtc/IMPACT_NOTIONAL)*askprice
-       
-        if asksleft>IMPACT_NOTIONAL:  
-            impactask=impactask-(askbtc/IMPACT_NOTIONAL)*askprice
-            priorlastask=asksleft-askbtc
-            lastask=IMPACT_NOTIONAL-priorlastask
-            impactask=impactask+askprice*(lastask/IMPACT_NOTIONAL)
- 
-    #impact mid
- 
-    impactmid=(impactask+impactbid)/2
- 
-#Impact Mid computation matches up close (but not perfect) with BitMEX's posted
- 
- 
-#Fair price calculation
- 
-#From the BitMEX site https://www.bitmex.com/app/fairPriceMarking :
- 
-#% Fair Basis = (Impact Mid Price / Index Price - 1) / (Time To Expiry / 365)
-#Fair Value   = Index Price * % Fair Basis * (Time to Expiry / 365)
-#Fair Price   = Index Price + Fair Value
- 
-fairbasis=(impactmid/indexprice-1)/(TTE/365)
-fairvalue=indexprice*fairbasis*(TTE/365)
-fairprice=indexprice+fairvalue
- 
- 
- 
- 
- 
-print("BitMEX numbers:\nIndex price: "+str(postedindexprice)+"\nImpact bid: "+str(postedimpactbid)+"\nImpact ask: "+str(postedimpactask)+"\nImpact mid: "+str(postedimpactmid)+"\n"+"Fair basis rate: "+str(postedfairbasisrate)+"\nFair basis: "+str(postedfairbasis)+"\nMark price: "+str(postedmarkprice)+"\n")
- 
-print("Computed numbers:\nIndex price: "+str(indexprice)+"\nImpact bid: "+str(impactbid)+"\nImpact ask: "+str(impactask)+"\nImpact mid: "+str(impactmid)+"\nFair basis rate: "+str(fairbasis)+"\nFair basis: "+str(fairvalue)+"\nFair price: "+str(fairprice))
+
+
+def main():
+    instrument = getInstrument(SYMBOL)
+    calcResult = fullCalculation(instrument)
+    printResults(instrument, calcResult)
+
+
+# Init
+if __name__ == "__main__":
+    main()
