@@ -8,6 +8,8 @@ import json
 import dateutil.parser
 from prettytable import PrettyTable
 import time
+import sys
+from bitmex_ws import BitMEXWebsocket
 
 # Initial setup parameters
 DEBUG = False
@@ -72,11 +74,6 @@ def makeXBTIndex():
 
 def getInstrument(symbol):
     return scrapeurl("https://www.bitmex.com/api/v1/instrument?symbol="+symbol)[0]
-
-
-def pluck(dict, *args):
-    '''Returns destructurable keys from dict'''
-    return (dict[arg] for arg in args)
 
 
 def value(multiplier, price, qty):
@@ -181,36 +178,54 @@ def fullCalculation(instrument):
 
 def printResults(instrument, calcResult):
 
-    def makeResults(indexPrice, impactBid, impactAsk, impactMid, fairBasisRate, fairBasis, markPrice):
-        return [
-            'Index Price: %.2f' % indexPrice,
-            'Impact Bid: %.2f' % impactBid,
-            'Impact Ask: %.2f' % impactAsk,
-            'Impact Mid: %.2f' % impactMid,
-            'Fair Basis Rate: %.2f' % fairBasisRate,
-            'Fair Basis: %.2f' % fairBasis,
-            'Mark/Fair Price: %.2f' % markPrice,
-        ]
-
-    table = PrettyTable(['Key', 'BitMEX', 'Computed'])
+    table = PrettyTable(['Key', 'BitMEX', 'Computed', 'Difference'])
     table.float_format = ".2"
     table.align = 'r'
-    table.add_row(['Index Price', instrument['indicativeSettlePrice'], calcResult['indicativeSettlePrice']])
-    table.add_row(['Impact Bid', instrument['impactBidPrice'], calcResult['impactBidPrice']])
-    table.add_row(['Impact Ask', instrument['impactAskPrice'], calcResult['impactAskPrice']])
-    table.add_row(['Impact Mid', instrument['impactMidPrice'], calcResult['impactMidPrice']])
-    table.add_row(['Fair Basis Rate', instrument['fairBasisRate'], calcResult['fairBasisRate']])
-    table.add_row(['Fair Basis', instrument['fairBasis'], calcResult['fairBasis']])
-    table.add_row(['Fair Price', instrument['fairPrice'], calcResult['fairPrice']])
+    rows = [
+        # Label, Key
+        ['Index Price', 'indicativeSettlePrice'],
+        ['Impact Bid', 'impactBidPrice'],
+        ['Impact Ask', 'impactAskPrice'],
+        ['Impact Mid', 'impactMidPrice'],
+        ['% Fair Basis Rate', 'fairBasisRate', lambda x: "%.2f%%" % (x * 100)],
+        ['Fair Basis', 'fairBasis'],
+        ['Fair Price', 'fairPrice']
+    ]
+    for row in rows:
+        label, key = row[:2]
+        # Formatter
+        fn = row[2] if len(row) == 3 else lambda x: x
+        table.add_row([label, fn(instrument[key]), fn(calcResult[key]), fn(calcResult[key] - instrument[key])])
+
     print(table)
 
 #######################################################################
 
 
 def main():
-    instrument = getInstrument(SYMBOL)
+    websocket = BitMEXWebsocket()
+    websocket.connect(symbol=SYMBOL)
+    instrument = websocket.get_instrument(SYMBOL)
     calcResult = fullCalculation(instrument)
+    print('Initial Calculation:')
     printResults(instrument, calcResult)
+    print('Note that this calculation\'s fairBasisRate was not calculated at the same time as the trading engine, ' +
+          'which will cause some divergence.')
+    print('For more accuracy, waiting until next fairPrice update.')
+    lastFairBasisRate = instrument['fairBasisRate']
+    iters = 0
+    while True:
+        time.sleep(0.1)
+        sys.stdout.write("\rWaiting" + (((iters % 5) + 1) * '.'))
+        sys.stdout.flush()
+        iters += 1
+        instrument = websocket.get_instrument(SYMBOL)
+        if instrument['fairBasisRate'] != lastFairBasisRate:
+            print('Caught change of fairBasisRate from %.2f to %.2f. Recalculating...' %
+                  (lastFairBasisRate, instrument['fairBasisRate']))
+            calcResult = fullCalculation(instrument)
+            printResults(instrument, calcResult)
+            break
 
 
 # Init
